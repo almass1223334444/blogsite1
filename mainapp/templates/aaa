@@ -1,0 +1,1035 @@
+  print(
+                f"Failed to download exploits database: HTTP {response.status_code}")
+    except requests.RequestException as e:
+        print(f"Exploit-DB site is not available or request failed: {e}")
+
+
+def load_exploit_db():
+    """Loads exploits data from a local CSV file if available."""
+    exploit_db = {}
+    if os.path.exists('files_exploits.csv'):
+        with open('files_exploits.csv', mode='r', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row['codes'] is not None:
+                    cve_codes = row['codes'].split(';')
+                    for cve in cve_codes:
+                        cve = cve.strip()
+                        if cve:
+                            exploit_db.setdefault(cve, []).append({
+                                'id': row['id'],
+                                'title': row['description'],
+                                'url': f"https://www.exploit-db.com/exploits/{row['id']}"
+                            })
+                else:
+                    print(
+                        f"Warning: No CVE codes found for exploit ID {row['id']}")
+    else:
+        print("Local exploits database not found. Proceeding without it.")
+    return exploit_db
+
+# ----------------------------cve_finlder_from_nist-----------------------------
+
+
+async def search_cve_parallel(services_versions):
+    """Concurrently searches for CVEs for each service/version."""
+
+    async def fetch_cve(product_version, retries=3, delay=2):
+        product, version = product_version
+        query = f"{product}:{version}".strip()
+        link = f"https://nvd.nist.gov/vuln/search/results?form_type=Advanced&results_type=overview&search_type=all&isCpeNameSearch=false&cpe_product=cpe:/::{query}"
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(retries):
+                try:
+                    async with session.get(link) as response:
+                        if response.status == 200:
+                            soup = BeautifulSoup(await response.text(), 'html.parser')
+                            cve_details = []
+                            for result in soup.find_all(
+                                'tr', {
+                                    'data-testid': lambda x: x and x.startswith('vuln-row-')}):
+                                cve_id_tag = result.find('a', {
+                                    'data-testid': lambda x: x and x.startswith('vuln-detail-link-')})
+                                if cve_id_tag:
+                                    cve_id = cve_id_tag.get_text()
+                                    summary_tag = result.find(
+                                        'p', {'data-testid': lambda x: x and x.startswith('vuln-summary-')})
+                                    summary = summary_tag.get_text(
+                                        strip=True) if summary_tag else "Summary not available"
+                                    severity_tag = result.find(
+                                        'a', {'data-testid': lambda x: x and x.endswith('vuln-cvss3-link-0')})
+                                    severity = severity_tag.get_text(
+                                        strip=True) if severity_tag else "Severity not available"
+                                    cve_details.append(
+                                        {'id': cve_id, 'summary': summary, 'severity': severity})
+                            return cve_details
+                        else:
+                            print(
+                                f"Response status {response.status} for {link}")
+                except aiohttp.ClientConnectorError as e:
+                    print(f"Connection error for {link}: {e}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+            return []
+    cves_results = {}
+    tasks = [fetch_cve(sv) for sv in set(services_versions)]
+    results = await asyncio.gather(*tasks)
+    for i, sv in enumerate(set(services_versions)):
+        cves_results[sv] = results[i]
+    return cves_results
+
+
+# -----------------------------------------Final_Function--------------------------------------
+
+
+async def combined_scan_and_exploit_lookup(input_file, output_file, user_id, app_context, update_session_status):
+    with app_context:
+        print(f"Starting scan for user {user_id} with IPs from {input_file}")
+
+        # Read IP addresses from the input file
+        with open(input_file, 'r') as file:
+            ip_addresses = [line.strip() for line in file.readlines()]
+
+        start_time = datetime.now()
+
+        # Check if the scan has been stopped before starting Masscan
+        if scan_status_tracker[user_id] == 'stopped':
+            print(f"Scan stopped by user {user_id} before starting Masscan")
+            return
+
+        # Run Masscan
+        run_masscan(input_file, output_file)
+
+        # Check if the scan has been stopped after running Masscan
+        if scan_status_tracker[user_id] == 'stopped':
+            print(f"Scan stopped by user {user_id} after Masscan")
+            return
+
+        ip_ports = process_masscan_output(output_file)
+
+        # Update and load the local exploit database
+        update_exploits_csv()
+        exploit_db = load_exploit_db()
+
+        scan_results = {}
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            futures = [executor.submit(nmap_scan, ip, ports)
+                       for ip, ports in ip_ports.items()]
+            for future in as_completed(futures):
+                # Check if the scan has been stopped during Nmap scans
+                if scan_status_tracker[user_id] == 'stopped':
+                    print(f"Scan stopped by user {user_id} during Nmap scans")
+                    return
+                ip, xml_output = future.result()
+                ip, port_data = parse_nmap_output(
+                    ip, xml_output.decode('utf-8'))
+                scan_results[ip] = port_data
+                print(f"Nmap scan results for {ip}: {port_data}")
+
+        # Check if the scan has been stopped after Nmap scans
+        if scan_status_tracker[user_id] == 'stopped':
+            print(f"Scan stopped by user {user_id} after Nmap scans")
+            return
+        services_versions = [
+            (ip,
+             service['port'],
+             service['service'],
+             service['version']) for ip,
+            services in scan_results.items() for service in services]
+        print(f"Services and versions: {services_versions}")
+
+        cves_results = await search_cve_parallel([(service, version) for _, _, service, version in services_versions])
+        print(f"CVE results: {cves_results}")
+
+        vulnerabilities = {}
+        for ip, services in scan_results.items():
+            for service in services:
+                cves_for_service = cves_results.get(
+                    (service['service'], service['version']), [])
+                for cve_detail in cves_for_service:
+                    cve_id = cve_detail['id']
+                    exploits_aggregate = []
+                    local_exploits = exploit_db.get(cve_id, [])
+                    exploits_aggregate.extend(local_exploits)
+                    github_exploits = await search_github_for_exploits_by_cve([cve_id])
+                    exploits_aggregate.extend(github_exploits)
+                    vulnerabilities.setdefault(ip, []).append({
+                        'port': service['port'],
+                        'service': service['service'],
+                        'version': service['version'],
+                        'cves': [cve_detail],
+                        'exploits': exploits_aggregate
+                    })
+
+        print(f"Vulnerabilities: {vulnerabilities}")
+
+        result_json_filename = f"result_{user_id}.json"
+        with open(result_json_filename, 'w') as file:
+            json.dump(vulnerabilities, file, indent=4)
+
+        # Load subdomains data
+        subdomains_file = f'subdomains_{user_id}.json'
+        with open(subdomains_file, 'r') as file:
+            subdomains = json.load(file)
+        ip_to_subdomain = {subdomain['ip']: subdomain['subdomain']
+                           for subdomain in subdomains if 'subdomain' in subdomain}
+        subdomains_exist = any(
+            subdomain['subdomain'] != 'N/A' for subdomain in subdomains)
+
+        # Generate PDF report path
+        pdf_report_path = generate_pdf_report_descr(
+            user_id, vulnerabilities, ip_to_subdomain, subdomains_exist)
+
+        # Save the scan history to the database
+        new_scan_history = ScanHistory(
+            user_id=user_id,
+            ip_addresses=','.join(ip_addresses),
+            scan_date=datetime.utcnow(),
+            pdf_report_path=pdf_report_path
+        )
+        db.session.add(new_scan_history)
+        db.session.commit()
+
+        if scan_status_tracker[user_id] != 'stopped':
+            scan_status_tracker[user_id] = 'completed'
+            update_session_status('completed')
+        print(
+            f"Total scan and exploit lookup time: {datetime.now() - start_time}")
+
+
+def flatten_data(vulnerabilities, subdomains):
+    flattened_data = []
+    for ip, services in vulnerabilities.items():
+        for service in services:
+            cves = service.get('cves', [])
+            # Prepare CVEs for template rendering
+            cve_details = [
+                {'name': cve, 'url': f"https://nvd.nist.gov/vuln/detail/{cve}"} for cve in cves]
+            flattened_data.append({
+                'subdomain': subdomains.get(ip, 'N/A'),
+                'ip': ip,
+                'port': service['port'],
+                'service': service.get('service', ''),
+                'version': service.get('version', ''),
+                'cves': cve_details,  # Ensure this matches the template structure
+                'exploits': service.get('exploits', []),
+                'cve_count': len(cves),
+                'exploit_count': len(service.get('exploits', []))
+            })
+    return flattened_data
+
+
+def sort_data(data, sort_by='ip', order='asc'):
+    reverse = order == 'desc'
+    if sort_by in ['port', 'cve_count', 'exploit_count']:
+        data.sort(key=lambda x: int(x[sort_by]), reverse=reverse)
+    else:  # For 'ip' or any other string-based sorting
+        data.sort(key=lambda x: x[sort_by], reverse=reverse)
+    return data
+
+# -------------------------------SubDomains-----------------------
+
+
+@app.route('/Subdomains')
+@login_required
+def subdomains():
+    user_id = session.get('user_id')
+    subdomains_file = f'subdomains_{user_id}.json'
+
+    with open(subdomains_file, 'r') as file:
+        subdomains_data = json.load(file)
+
+    return render_template('subdomains_list.html', subdomains=subdomains_data)
+
+# ------------------------------AppRoutes---------------------------------
+
+
+@app.route('/scan', methods=['POST'])
+@login_required
+def scan():
+    return redirect(url_for('open_ports'))
+
+
+@app.route('/open_ports')
+@login_required
+def open_ports():
+    user_id = session.get('user_id')
+    result_file = f'result_{user_id}.json'
+    subdomains_file = f'subdomains_{user_id}.json'
+
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    sort_by = request.args.get('sort', 'ip')  # Default sort by IP
+    order = request.args.get('order', 'asc')  # Default order ascending
+
+    try:
+        with open(result_file, 'r') as file:
+            ports_data = json.load(file)
+            if isinstance(ports_data, list):  # Check if ports_data is a list
+                # Convert to dictionary
+                ports_data = {item['ip']: item for item in ports_data}
+    except (FileNotFoundError, json.JSONDecodeError):
+        ports_data = {}
+
+    try:
+        with open(subdomains_file, 'r') as file:
+            subdomains = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        subdomains = []
+
+    ip_to_subdomain = {subdomain['ip']: subdomain['subdomain']
+                       for subdomain in subdomains}
+
+    merged_data = []
+    total_cves = 0
+    total_exploits = 0
+    total_open_ports = 0
+    for ip, services in ports_data.items():
+        for service in services:
+            cves = service.get(
+                'cves', []) if isinstance(
+                service, dict) else []  # Check if service is a dictionary
+            exploits = service.get('exploits', []) if isinstance(
+                service, dict) else []  # Check if service is a dictionary
+            total_cves += len(cves)
+            total_exploits += len(exploits)
+            total_open_ports += 1
+            merged_data.append({
+                'subdomain': ip_to_subdomain.get(ip, 'N/A'),
+                'ip': ip,
+                # Check if service is a dictionary
+                'port': service['port'] if isinstance(service, dict) else 'N/A',
+                # Check if service is a dictionary
+                'service': service.get('service', '') if isinstance(service, dict) else 'N/A',
+                # Check if service is a dictionary
+                'version': service.get('version', '') if isinstance(service, dict) else 'N/A',
+                'cves': cves,
+                'exploits': exploits,
+                'ip_cves': len(cves),
+                'ip_exploits': len(exploits),
+                'ip_open_ports': len(services)
+            })
+
+    subdomains_exist = any(item['subdomain'] != 'N/A' for item in merged_data)
+
+    # Sorting logic
+    reverse = order == 'desc'
+    if sort_by in ['cves', 'exploits', 'port']:
+        merged_data.sort(key=lambda x: len(x[sort_by]), reverse=reverse)
+    else:
+        # Default to sorting by IP if sort_by is not recognized
+        merged_data.sort(key=lambda x: x['ip'], reverse=reverse)
+
+    # Pagination logic
+    total = len(merged_data)
+    start = (page - 1) * per_page
+    end = min(start + per_page, total)  # Ensure we don't go out of range
+    current_data = merged_data[start:end]
+    total_pages = (total + per_page - 1) // per_page
+
+    # Render the template with merged data
+    return render_template(
+        'Open-ports.html',
+        merged_data=current_data,
+        current_page=page,
+        total_pages=total_pages,
+        per_page=per_page,
+        total_cves=total_cves,
+        total_exploits=total_exploits,
+        total_open_ports=total_open_ports,
+        sort_by=sort_by,
+        order=order,
+        subdomains_exist=subdomains_exist,
+        user_id=user_id
+    )
+
+
+def sort_ports_data(ports_data, sort_by, order):
+    if sort_by == 'index':
+        # Sort based on the position in the list if 'index' or similar is your
+        # sorting key
+        sorted_data = sorted(
+            enumerate(ports_data),
+            key=lambda x: x[0],
+            reverse=(
+                order == 'desc'))
+        # Remove the index from the sorted data if necessary, or adjust based
+        # on your needs
+        sorted_data = [item[1] for item in sorted_data]
+    else:
+        # For other keys, continue sorting as before
+        sorted_data = sorted(
+            ports_data, key=lambda x: x.get(
+                sort_by, 0), reverse=(
+                order == 'desc'))
+    return sorted_data
+
+
+@app.route('/submit_ip', methods=['POST'])
+@login_required
+def submit_ip():
+    user_id = session.get('user_id')
+    ip_format = request.form.get('ip_format')
+    input_data = request.form.get('ip_addresses', '').strip()
+
+    try:
+        if ip_format == 'domain':
+            # Fetch data from the API for the domain
+            json_response = requests.get(
+                API_URL + f"api/subdomains?domain={input_data}").json()
+            ips_to_scan = [subdomain['ip']
+                           for subdomain in json_response if 'ip' in subdomain]
+
+            # Save the subdomains data to the file
+            subdomains_file = f'subdomains_{user_id}.json'
+            with open(subdomains_file, 'w') as file:
+                json.dump(json_response, file)
+
+        elif ip_format == 'subnet':
+            network = ipaddress.ip_network(input_data, strict=False)
+            ips_to_scan = [str(ip) for ip in network.hosts()]
+
+        elif ip_format == 'range':
+            start_ip, end_ip = input_data.split('-')
+            ips_to_scan = ip_range(start_ip, end_ip)
+
+        elif ip_format == 'list':
+            ips_to_scan = input_data.split()
+
+        else:
+            return redirect(url_for('index'))
+
+        input_file = f'input_{user_id}.txt'
+        result_file = f'result_{user_id}.json'
+        with open(input_file, 'w') as file:
+            for ip in ips_to_scan:
+                file.write(f"{ip}\n")
+
+        scan_status_tracker[user_id] = 'running'
+        session['scan_status'] = 'running'
+        session.modified = True
+        print(f"Starting scan for user {user_id} with IPs: {ips_to_scan}")
+
+        @copy_current_request_context
+        def update_session_status(status):
+            session['scan_status'] = status
+            session.modified = True
+
+        app_context = app.app_context()
+        thread = Thread(
+            target=lambda: asyncio.run(
+                combined_scan_and_exploit_lookup(
+                    input_file,
+                    result_file,
+                    user_id,
+                    app_context,
+                    update_session_status
+                )
+            )
+        )
+        thread.start()
+        return redirect(url_for('index'))
+
+    except Exception as e:
+        flash(f'Error: {str(e)}', 'error')
+        return redirect(url_for('index'))
+
+
+@app.before_request
+def update_scan_status_in_session():
+    user_id = session.get('user_id')
+    if user_id and session.get('scan_status') != 'running':
+        session['scan_status'] = scan_status_tracker.get(
+            user_id, 'not_started')
+        session.modified = True
+
+
+def update_scan_status(user_id, status):
+    with scan_status_lock:
+        scan_status_tracker[user_id] = status
+        session['scan_status'] = status
+        session.modified = True
+
+
+@app.route('/scan_status')
+@login_required
+def scan_status():
+    user_id = session.get('user_id')
+    status = scan_status_tracker.get(user_id, 'no_scan')
+    return jsonify({'status': status})
+
+
+@app.route('/stop_scan')
+@login_required
+def stop_scan():
+    user_id = session.get('user_id')
+    update_scan_status(user_id, 'stopped')
+    print(f"Scan stopped by user {user_id}")
+    return jsonify({'status': 'stopped'})
+
+
+@app.route('/reset_scan_status')
+@login_required
+def reset_scan_status():
+    user_id = session.get('user_id')
+    with scan_status_lock:
+        scan_status_tracker[user_id] = 'not_started'
+    return jsonify({'status': 'reset'})
+
+
+@app.route('/check_scan_completion_status')
+@login_required
+def check_scan_completion_status():
+    user_id = session.get('user_id')
+    with scan_status_lock:
+        status = scan_status_tracker.get(user_id, 'not_started')
+    return jsonify({'status': status})
+
+
+@app.route('/threats')
+@login_required
+def threats():
+    user_id = session.get('user_id')
+    result_file = f'result_{user_id}.json'
+    subdomains_file = f'subdomains_{user_id}.json'
+
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    sort_by = request.args.get('sort', 'ip')  # Default sort by IP
+    order = request.args.get('order', 'asc')  # Default order ascending
+
+    try:
+        with open(result_file, 'r') as file:
+            ports_data = json.load(file)
+            if not isinstance(ports_data, dict):
+                ports_data = {}
+    except (json.JSONDecodeError, FileNotFoundError):
+        flash('Error loading ports data.', 'danger')
+        ports_data = {}
+
+    with open(subdomains_file, 'r') as file:
+        subdomains = json.load(file)
+
+    ip_to_subdomain = {subdomain['ip']: subdomain['subdomain']
+                       for subdomain in subdomains}
+
+    merged_data = []
+    total_cves = 0
+    total_exploits = 0
+    for ip, services in ports_data.items():
+        ip_cves = 0
+        ip_exploits = 0
+        for service in services:
+            cves = service.get('cves', [])
+            exploits = service.get('exploits', [])
+            ip_cves += len(cves)
+            ip_exploits += len(exploits)
+            merged_data.append({
+                'subdomain': ip_to_subdomain.get(ip, 'N/A'),
+                'ip': ip,
+                'port': service['port'],
+                'service': service.get('service', ''),
+                'version': service.get('version', ''),
+                'cves': cves,
+                'exploits': exploits,
+                'ip_cves': ip_cves,
+                'ip_exploits': ip_exploits
+            })
+        total_cves += ip_cves
+        total_exploits += ip_exploits
+
+    total_open_ports = len(merged_data)
+    subdomains_exist = any(item['subdomain'] != 'N/A' for item in merged_data)
+
+    # Sorting logic
+    reverse = order == 'desc'
+    if sort_by in ['cves', 'exploits', 'port']:
+        merged_data.sort(key=lambda x: len(x[sort_by]), reverse=reverse)
+    else:
+        # Default to sorting by IP if sort_by is not recognized
+        merged_data.sort(key=lambda x: x['ip'], reverse=reverse)
+
+    # Pagination logic
+    total = len(merged_data)
+    start = (page - 1) * per_page
+    end = min(start + per_page, total)  # Ensure we don't go out of range
+    current_data = merged_data[start:end]
+    total_pages = (total + per_page - 1) // per_page
+
+    # Render the template with merged data
+    return render_template(
+        'threats.html',
+        merged_data=current_data,
+        current_page=page,
+        total_pages=total_pages,
+        per_page=per_page,
+        total_cves=total_cves,
+        total_exploits=total_exploits,
+        total_open_ports=total_open_ports,
+        sort_by=sort_by,
+        order=order,
+        subdomains_exist=subdomains_exist,
+        user_id=user_id
+    )
+
+
+@app.route('/recom')
+@login_required
+def recom():
+    user_id = session.get('user_id')
+    result_file = f'result_{user_id}.json'
+    subdomains_file = f'subdomains_{user_id}.json'
+
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    sort_by = request.args.get('sort', 'ip')  # Default sort by IP
+    order = request.args.get('order', 'asc')  # Default order ascending
+
+    try:
+        with open(result_file, 'r') as file:
+            ports_data = json.load(file)
+            if isinstance(ports_data, list):  # Check if ports_data is a list
+                # Convert to dictionary
+                ports_data = {item['ip']: item for item in ports_data}
+    except (FileNotFoundError, json.JSONDecodeError):
+        ports_data = {}
+
+    try:
+        with open(subdomains_file, 'r') as file:
+            subdomains = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        subdomains = []
+
+    ip_to_subdomain = {subdomain['ip']: subdomain['subdomain']
+                       for subdomain in subdomains}
+
+    merged_data = []
+    total_cves = 0
+    total_exploits = 0
+    for ip, services in ports_data.items():
+        ip_cves = 0
+        ip_exploits = 0
+        for service in services:
+            cves = service.get(
+                'cves', []) if isinstance(
+                service, dict) else []  # Check if service is a dictionary
+            summaries = [cve['summary']
+                         for cve in cves]  # Extract summaries from cves
+            ip_cves += len(cves)
+            ip_exploits += len(service.get('exploits',
+                                           [])) if isinstance(service,
+                                                              dict) else 0  # Check if service is a dictionary
+            merged_data.append({
+                'subdomain': ip_to_subdomain.get(ip, 'N/A'),
+                'ip': ip,
+                # Check if service is a dictionary
+                'port': service['port'] if isinstance(service, dict) else 'N/A',
+                # Check if service is a dictionary
+                'service': service.get('service', '') if isinstance(service, dict) else 'N/A',
+                # Check if service is a dictionary
+                'version': service.get('version', '') if isinstance(service, dict) else 'N/A',
+                'cves': cves,
+                'summaries': summaries,  # Include summaries in the data
+                'ip_cves': ip_cves,
+                'ip_exploits': ip_exploits
+            })
+        total_cves += ip_cves
+        total_exploits += ip_exploits
+
+    total_open_ports = len(merged_data)
+    subdomains_exist = any(item['subdomain'] != 'N/A' for item in merged_data)
+
+    # Sorting logic
+    reverse = order == 'desc'
+    if sort_by in ['cves', 'exploits', 'port']:
+        merged_data.sort(key=lambda x: len(x[sort_by]), reverse=reverse)
+    else:
+        # Default to sorting by IP if sort_by is not recognized
+        merged_data.sort(key=lambda x: x['ip'], reverse=reverse)
+
+    # Pagination logic
+    total = len(merged_data)
+    start = (page - 1) * per_page
+    end = min(start + per_page, total)  # Ensure we don't go out of range
+    current_data = merged_data[start:end]
+    total_pages = (total + per_page - 1) // per_page
+
+    # Render the template with merged data
+    return render_template(
+        'recom.html',  # Use a new template for recommendations
+        merged_data=current_data,
+        current_page=page,
+        total_pages=total_pages,
+        per_page=per_page,
+        total_cves=total_cves,
+        total_exploits=total_exploits,
+        total_open_ports=total_open_ports,
+        sort_by=sort_by,
+        order=order,
+        subdomains_exist=subdomains_exist,
+        user_id=user_id
+    )
+
+
+@app.route('/darknet')
+@login_required
+def darknet():
+    user_id = session.get('user_id')
+    histories = ScanHistory.query.filter_by(
+        user_id=user_id).order_by(
+        ScanHistory.scan_date.desc()).all()
+    return render_template('darknet.html', histories=histories)
+
+
+@app.route('/osint')
+@login_required
+def shodan():
+    user_id = session.get('user_id')
+    try:
+        # Load the Shodan data from the file
+        shodan_file = f'shodan_{user_id}.json'
+        with open(shodan_file, 'r') as file:
+            shodan_data = json.load(file)
+    except FileNotFoundError:
+        shodan_data = []
+        flash(
+            'No Shodan data found. Please submit a domain for scanning.',
+            'warning')
+
+    return render_template('shodan.html', shodan_data=shodan_data)
+
+
+@app.route('/general')
+@login_required
+def general():
+    user_id = session.get('user_id')
+    try:
+        # Load the Shodan data from the file
+        shodan_file = f'shodan_{user_id}.json'
+        with open(shodan_file, 'r') as file:
+            shodan_data = json.load(file)
+    except FileNotFoundError:
+        shodan_data = []
+        flash(
+            'No Shodan data found. Please submit a domain for scanning.',
+            'warning')
+
+    return render_template('general.html', shodan_data=shodan_data)
+
+
+@app.route('/inf')
+@login_required
+def inf():
+    user_id = session.get('user_id')
+    try:
+        # Load the Shodan data from the file
+        shodan_file = f'shodan_{user_id}.json'
+        with open(shodan_file, 'r') as file:
+            shodan_data = json.load(file)
+    except FileNotFoundError:
+        shodan_data = []
+        flash(
+            'No Shodan data found. Please submit a domain for scanning.',
+            'warning')
+
+    return render_template('inf.html', shodan_data=shodan_data)
+
+
+@app.route('/features')
+@login_required
+def features():
+    user_id = session.get('user_id')
+    try:
+        # Load the Dorks data from the file
+        dorks_file = f'dorks_{user_id}.json'
+        with open(dorks_file, 'r') as file:
+            dorks_data = json.load(file)
+    except FileNotFoundError:
+        dorks_data = []
+        flash('No Dorks data found. Please submit a domain for scanning.', 'warning')
+
+    return render_template('features.html', dorks_data=dorks_data)
+
+
+@app.route('/Hosts')
+@login_required
+def hosts():
+    user_id = session.get('user_id')
+    histories = ScanHistory.query.filter_by(
+        user_id=user_id).order_by(
+        ScanHistory.scan_date.desc()).all()
+    return render_template('Hosts.html', histories=histories)
+
+
+@app.route('/Users')
+@login_required
+def users():
+    user_id = session.get('user_id')
+    if user_id:
+        user = User.query.get(user_id)
+        if user:
+            return render_template(
+                'users.html',
+                username=user.username,
+                email=user.email,
+                registration_date=user.registration_date)
+    return redirect(url_for('login'))
+
+
+# --------------------------------------PdfReports---------------------------------------
+
+
+@app.route('/generate_pdf_report')
+@login_required
+def generate_pdf_report_route():
+    user_id = session.get('user_id')
+    latest_scan = ScanHistory.query.filter_by(
+        user_id=user_id).order_by(
+        ScanHistory.scan_date.desc()).first()
+
+    if not latest_scan:
+        flash("No scan history found for generating the report.", "danger")
+        return redirect(url_for('dashboard'))
+
+    ip_addresses = latest_scan.ip_addresses.split(',')
+    result_file = f'result_{user_id}.json'
+    subdomains_file = f'subdomains_{user_id}.json'
+
+    with open(result_file, 'r') as file:
+        vulnerabilities = json.load(file)
+
+    with open(subdomains_file, 'r') as file:
+        subdomains = json.load(file)
+
+    ip_to_subdomain = {subdomain['ip']: subdomain['subdomain']
+                       for subdomain in subdomains}
+    subdomains_exist = any(
+        subdomain['subdomain'] != 'N/A' for subdomain in subdomains)
+
+    pdf_file_path = generate_pdf_report(
+        user_id,
+        vulnerabilities,
+        ip_to_subdomain,
+        subdomains_exist)
+
+    return send_from_directory(
+        os.path.dirname(pdf_file_path),
+        os.path.basename(pdf_file_path),
+        as_attachment=True)
+
+
+@app.route('/generate_pdf_report_descr')
+@login_required
+def generate_pdf_report_route_descr():
+    user_id = session.get('user_id')
+    latest_scan = ScanHistory.query.filter_by(
+        user_id=user_id).order_by(
+        ScanHistory.scan_date.desc()).first()
+
+    if not latest_scan:
+        flash("No scan history found for generating the report.", "danger")
+        return redirect(url_for('dashboard'))
+
+    ip_addresses = latest_scan.ip_addresses.split(',')
+    result_file = f'result_{user_id}.json'
+    subdomains_file = f'subdomains_{user_id}.json'
+
+    with open(result_file, 'r') as file:
+        vulnerabilities = json.load(file)
+
+    with open(subdomains_file, 'r') as file:
+        subdomains = json.load(file)
+
+    ip_to_subdomain = {subdomain['ip']: subdomain['subdomain']
+                       for subdomain in subdomains}
+    subdomains_exist = any(
+        subdomain['subdomain'] != 'N/A' for subdomain in subdomains)
+
+    pdf_file_path = generate_pdf_report_descr(
+        user_id, vulnerabilities, ip_to_subdomain, subdomains_exist)
+
+    return send_from_directory(
+        os.path.dirname(pdf_file_path),
+        os.path.basename(pdf_file_path),
+        as_attachment=True)
+
+
+def generate_pdf_report_descr(
+        user_id,
+        vulnerabilities,
+        ip_to_subdomain,
+        subdomains_exist):
+    total_cve = sum(len(service.get('cves', []))
+                    for services in vulnerabilities.values() for service in services)
+    total_ports = sum(len(services) for services in vulnerabilities.values())
+    total_exploits = sum(len(service.get('exploits', []))
+                         for services in vulnerabilities.values() for service in services)
+
+    # Flatten the data for the template
+    flattened_data = []
+    for ip, services in vulnerabilities.items():
+        for service in services:
+            cves = service.get('cves', [])
+            summaries = [cve['summary'] for cve in cves]
+            flattened_data.append({
+                'subdomain': ip_to_subdomain.get(ip, 'N/A'),
+                'ip': ip,
+                'port': service.get('port', ''),
+                'service': service.get('service', ''),
+                'version': service.get('version', ''),
+                'cves': cves,
+                'summaries': summaries
+            })
+
+    rendered_html = render_template(
+        'report_template_descr.html',
+        total_cve=total_cve,
+        total_ports=total_ports,
+        total_exploits=total_exploits,
+        merged_data=flattened_data,
+        subdomains_exist=subdomains_exist
+    )
+
+    pdfkit_options = {
+        'page-size': 'A4',
+        'margin-top': '0.75in',
+        'margin-right': '0.75in',
+        'margin-bottom': '0.75in',
+        'margin-left': '0.75in',
+        'encoding': "UTF-8",
+        'custom-header': [('Accept-Encoding', 'gzip')],
+        'load-error-handling': 'ignore'  # Ignore load errors
+    }
+
+    config = pdfkit.configuration(wkhtmltopdf='/usr/bin/wkhtmltopdf')
+    pdf_file_name = f"report_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    pdf_file_path = os.path.join('static/pdf_reports', pdf_file_name)
+    pdfkit.from_string(
+        rendered_html,
+        pdf_file_path,
+        configuration=config,
+        options=pdfkit_options
+    )
+
+    return pdf_file_path
+
+
+def generate_pdf_report(
+        user_id,
+        vulnerabilities,
+        ip_to_subdomain,
+        subdomains_exist):
+    total_cve = sum(len(service.get('cves', []))
+                    for services in vulnerabilities.values() for service in services)
+    total_ports = sum(len(services) for services in vulnerabilities.values())
+    total_exploits = sum(len(service.get('exploits', []))
+                         for services in vulnerabilities.values() for service in services)
+
+    # Flatten the data for the template
+    flattened_data = []
+    for ip, services in vulnerabilities.items():
+        for service in services:
+            flattened_data.append({
+                'subdomain': ip_to_subdomain.get(ip, 'N/A'),
+                'ip': ip,
+                'port': service.get('port', ''),
+                'service': service.get('service', ''),
+                'version': service.get('version', ''),
+                'cves': service.get('cves', []),
+                'exploits': service.get('exploits', [])
+            })
+
+    rendered_html = render_template(
+        'report_template.html',
+        total_cve=total_cve,
+        total_ports=total_ports,
+        total_exploits=total_exploits,
+        merged_data=flattened_data,
+        subdomains_exist=subdomains_exist
+    )
+
+    pdfkit_options = {
+        'page-size': 'A4',
+        'margin-top': '0.75in',
+        'margin-right': '0.75in',
+        'margin-bottom': '0.75in',
+        'margin-left': '0.75in',
+        'encoding': "UTF-8",
+        'custom-header': [('Accept-Encoding', 'gzip')],
+        'load-error-handling': 'ignore'  # Ignore load errors
+    }
+
+    config = pdfkit.configuration(wkhtmltopdf='/usr/bin/wkhtmltopdf')
+    pdf_file_name = f"report_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    pdf_file_path = os.path.join('static/pdf_reports', pdf_file_name)
+    pdfkit.from_string(
+        rendered_html,
+        pdf_file_path,
+        configuration=config,
+        options=pdfkit_options
+    )
+
+    return pdf_file_path
+
+
+def save_pdf_report(ip_address, user_id):
+    # Call the existing generate_pdf_report function to get PDF data
+    pdf_data = generate_pdf_report_descr(
+        user_id, ip_address)  # Adjust this call as needed
+
+    # Define PDF file path
+    pdf_file_name = f"report_{ip_address}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    pdf_file_path = os.path.join(
+        'static/pdf_reports',
+        pdf_file_name)  # Adjust path as needed
+
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(pdf_file_path), exist_ok=True)
+
+    # Write PDF data to file
+    with open(pdf_file_path, 'wb') as file:
+        file.write(pdf_data)  # Adjust based on how pdf_data is structured
+
+    # Create new scan history entry with PDF report path
+    new_scan_history = ScanHistory(
+        user_id=user_id,
+        ip_addresses=ip_address,
+        scan_date=datetime.now(),
+        pdf_report_path=pdf_file_path)
+    db.session.add(new_scan_history)
+    db.session.commit()
+
+    return pdf_file_path
+
+
+@app.route('/download_report/<int:scan_id>')
+@login_required
+def download_report(scan_id):
+    scan_history = ScanHistory.query.get_or_404(scan_id)
+
+    # Ensure the user requesting the download owns the scan history
+    if scan_history.user_id != session.get('user_id'):
+        flash("You do not have permission to access this file.", "danger")
+        return redirect(url_for('hosts'))
+
+    # Use the stored PDF report path instead of generating a new report
+    pdf_file_path = scan_history.pdf_report_path
+
+    # Send the PDF file as a response
+    directory = os.path.abspath('static/pdf_reports')  # Adjust as needed
+    filename = os.path.basename(pdf_file_path)
+    try:
+        return send_from_directory(directory, filename, as_attachment=True)
+    except FileNotFoundError:
+        flash("The requested file was not found.", "danger")
+        return redirect(url_for('hosts'))
+
+
+def create_tables():
+    db.create_all()
+
+
+if __name__ == "__main__":
+    app.run(debug=True)

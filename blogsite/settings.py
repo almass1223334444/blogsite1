@@ -25,9 +25,8 @@ SECRET_KEY = 'django-insecure-s#43$u#@6evicd!xn&k)qpmrv1u_a%+wj3(s=b^dsp3b0!c-v%
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
+
 ALLOWED_HOSTS = []
-
-
 # Application definition
 
 INSTALLED_APPS = [
@@ -38,6 +37,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'mainapp',
+    'captcha',
 ]
 
 MIDDLEWARE = [
@@ -76,8 +76,12 @@ WSGI_APPLICATION = 'blogsite.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql', #DON'T TOUCH
+        'NAME': 'blogsite',
+        'USER': 'postgres', 
+        'PASSWORD': 'root',
+        'HOST': 'localhost',
+        'PORT': '5432'        #DON'T TOUCH
     }
 }
 

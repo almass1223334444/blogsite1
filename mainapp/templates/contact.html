@@ -1,11 +1,9 @@
 {% extends "base.html" %}
 
-
-{% block title %} Связь с нами {% endblock %}
+{% block title %}Связь с нами {% endblock %}
 
 {% block content %}
-
- <div class="container-fluid">
+<div class="container-fluid">
         <main class="tm-main">
 
             <div class="row tm-row tm-mb-45">
@@ -48,10 +46,10 @@
                                 <textarea class="form-control mr-0 ml-auto" name="message" id="message" rows="8" required></textarea>
                             </div>
                         </div>
-                        {% csrf_token %}
+                      {% csrf_token %}
                         <div class="form-group row text-right">
                             <div class="col-12">
-                                <button type = "submit" class="tm-btn tm-btn-primary tm-btn-small">Submit</button>
+                                <button type="submit" class="tm-btn tm-btn-primary tm-btn-small">Submit</button>
                             </div>
                         </div>
                     </form>
@@ -109,5 +107,6 @@
             </footer>
         </main>
     </div>
+
 
 {% endblock %}
